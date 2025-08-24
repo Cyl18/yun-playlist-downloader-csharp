@@ -1,3 +1,4 @@
+# Node.js (原有)
 node_modules
 *.log
 example
@@ -10,3 +11,79 @@ coverage
 /lib
 /dist
 **/tsconfig.tsbuildinfo
+
+# .NET
+bin/
+obj/
+*.user
+*.suo
+*.cache
+*.docstates
+*.dll
+*.exe
+*.pdb
+*.userprefs
+*.userosscache
+*.sln.docstates
+
+# Visual Studio
+.vs/
+*.vspx
+*.sap
+
+# User-specific files
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+
+# NuGet Packages
+*.nupkg
+# The packages folder can be ignored because of Package Restore
+**/[Pp]ackages/*
+# except build/, which is used as an MSBuild target.
+!**/[Pp]ackages/build/
+
+# Test results
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+
+# Cookie files
+*.cookie.txt
+yun.cookie.txt
+
+# Downloaded files
+downloads/
+音乐/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Coverage
+coverage/
+*.coverage
+*.coveragexml
+
+# Application specific
+appsettings.local.json
+appsettings.development.json

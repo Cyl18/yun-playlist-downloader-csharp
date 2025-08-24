@@ -5,20 +5,27 @@ on:
   - pull_request
 
 jobs:
-  unit-test:
+  build-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v4
-
-      - uses: actions/setup-node@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
         with:
-          node-version: lts/*
-          cache: pnpm
+          dotnet-version: '9.0.x'
 
-      - run: pnpm install
+      - name: Restore dependencies
+        run: dotnet restore
 
-      - run: pnpm test-cover
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
 
-      - uses: codecov/codecov-action@v5
+      - name: Test
+        run: dotnet test --no-build --configuration Release --collect:"XPlat Code Coverage"
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          directory: ./TestResults/
