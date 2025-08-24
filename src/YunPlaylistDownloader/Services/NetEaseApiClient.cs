@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using YunPlaylistDownloader.Models;
 using Polly;
 using Polly.Extensions.Http;
+using System.Collections.Concurrent;
 
 namespace YunPlaylistDownloader.Services;
 
@@ -15,6 +16,9 @@ public class NetEaseApiClient
     private const string BaseUrl = "https://music.163.com/api";
     private const int BatchSize = 200;
 
+    // 静态缓存，用于存储歌单详情
+    private static readonly ConcurrentDictionary<long, Playlist> _playlistCache = new();
+
     public NetEaseApiClient(HttpClient httpClient, ILogger<NetEaseApiClient> logger, CookieService cookieService)
     {
         _httpClient = httpClient;
@@ -24,8 +28,16 @@ public class NetEaseApiClient
 
     public async Task<Playlist?> GetPlaylistDetailAsync(long id)
     {
+        // 检查缓存
+        if (_playlistCache.TryGetValue(id, out var cachedPlaylist))
+        {
+            _logger.LogDebug("Found cached playlist detail for ID {Id}", id);
+            return cachedPlaylist;
+        }
+
         try
         {
+            _logger.LogDebug("Fetching playlist detail for ID {Id}", id);
             var url = $"{BaseUrl}/v6/playlist/detail?id={id}&n=100000&s=8";
             var response = await GetWithRetryAsync(url);
             
@@ -36,7 +48,24 @@ public class NetEaseApiClient
                 
                 if (json.RootElement.TryGetProperty("playlist", out var playlistElement))
                 {
-                    return ParsePlaylist(playlistElement);
+                    var playlist = ParsePlaylist(playlistElement);
+                    
+                    // 如果有 TrackIds，使用 TrackIds 来获取完整的歌曲列表
+                    if (playlist.TrackIds.Any())
+                    {
+                        _logger.LogInformation("Using TrackIds to get all {Count} tracks", playlist.TrackIds.Count);
+                        
+                        // 使用 TrackIds 获取歌曲详情
+                        var trackIds = playlist.TrackIds.Select(t => t.Id).ToList();
+                        var trackDetails = await GetSongDetailsAsync(trackIds);
+                        playlist.Tracks = trackDetails;
+                    }
+                    
+                    // 缓存结果
+                    _playlistCache.TryAdd(id, playlist);
+                    _logger.LogDebug("Cached playlist detail for ID {Id}", id);
+                    
+                    return playlist;
                 }
             }
         }
@@ -46,6 +75,53 @@ public class NetEaseApiClient
         }
         
         return null;
+    }
+
+    public async Task<List<TrackData>> GetSongDetailsAsync(List<long> songIds)
+    {
+        var allTracks = new List<TrackData>();
+        const int batchSize = 1000; // 歌曲数量不要超过1000
+
+        var chunks = songIds.Chunk(batchSize);
+        foreach (var chunk in chunks)
+        {
+            try
+            {
+                // 构建符合网易云API格式的参数
+                var cValue = "[" + string.Join(",", chunk.Select(id => $"{{\"id\":{id}}}")) + "]";
+                
+                var requestData = new FormUrlEncodedContent(new[]
+                {
+                    new KeyValuePair<string, string>("c", cValue)
+                });
+
+                var response = await PostWithRetryAsync($"{BaseUrl}/v3/song/detail", requestData);
+                if (response?.IsSuccessStatusCode == true)
+                {
+                    var content = await response.Content.ReadAsStringAsync();
+                    var json = JsonDocument.Parse(content);
+                    
+                    if (json.RootElement.TryGetProperty("songs", out var songsElement))
+                    {
+                        var tracks = ParseTracks(songsElement);
+                        allTracks.AddRange(tracks);
+                        
+                        _logger.LogInformation("Fetched details for {Count} songs, total: {Total}/{Expected}", 
+                            tracks.Count, allTracks.Count, songIds.Count);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to get song details for chunk");
+            }
+            
+            // Add delay to avoid rate limiting
+            await Task.Delay(100);
+        }
+
+        _logger.LogInformation("Successfully fetched details for {Count} songs total", allTracks.Count);
+        return allTracks;
     }
 
     public async Task<Album?> GetAlbumDetailAsync(long id)
@@ -160,6 +236,35 @@ public class NetEaseApiClient
         return await retryPolicy.ExecuteAsync(async () => await _httpClient.SendAsync(request));
     }
 
+    private async Task<HttpResponseMessage?> PostWithRetryAsync(string url, HttpContent content)
+    {
+        var retryPolicy = Policy
+            .HandleResult<HttpResponseMessage>(r => !r.IsSuccessStatusCode)
+            .Or<HttpRequestException>()
+            .WaitAndRetryAsync(
+                retryCount: 3,
+                sleepDurationProvider: retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),
+                onRetry: (outcome, timespan, retryCount, context) =>
+                {
+                    _logger.LogWarning("Retry {RetryCount} for URL: {Url} after {Delay}s", 
+                        retryCount, url, timespan.TotalSeconds);
+                });
+
+        var request = new HttpRequestMessage(HttpMethod.Post, url)
+        {
+            Content = content
+        };
+        
+        // Add cookie if available
+        var cookie = _cookieService.GetCookieString();
+        if (!string.IsNullOrEmpty(cookie))
+        {
+            request.Headers.Add("Cookie", cookie);
+        }
+
+        return await retryPolicy.ExecuteAsync(async () => await _httpClient.SendAsync(request));
+    }
+
     private static Playlist ParsePlaylist(JsonElement playlistElement)
     {
         var playlist = new Playlist
@@ -167,15 +272,44 @@ public class NetEaseApiClient
             Id = playlistElement.GetProperty("id").GetInt64(),
             Name = playlistElement.GetProperty("name").GetString() ?? "",
             CoverUrl = playlistElement.TryGetProperty("coverImgUrl", out var cover) ? cover.GetString() : null,
-            Description = playlistElement.TryGetProperty("description", out var desc) ? desc.GetString() ?? "" : ""
+            Description = playlistElement.TryGetProperty("description", out var desc) ? desc.GetString() ?? "" : "",
+            TrackCount = playlistElement.TryGetProperty("trackCount", out var trackCount) ? trackCount.GetInt64() : 0
         };
 
+        // 解析 Tracks (可能只有前1000首)
         if (playlistElement.TryGetProperty("tracks", out var tracksElement))
         {
             playlist.Tracks = ParseTracks(tracksElement);
         }
 
+        // 解析 TrackIds (包含所有歌曲ID)
+        if (playlistElement.TryGetProperty("trackIds", out var trackIdsElement))
+        {
+            playlist.TrackIds = ParseTrackIds(trackIdsElement);
+        }
+
         return playlist;
+    }
+
+    private static List<TrackIdData> ParseTrackIds(JsonElement trackIdsElement)
+    {
+        var trackIds = new List<TrackIdData>();
+        
+        foreach (var trackIdElement in trackIdsElement.EnumerateArray())
+        {
+            var trackId = new TrackIdData
+            {
+                Id = trackIdElement.GetProperty("id").GetInt64(),
+                V = trackIdElement.TryGetProperty("v", out var v) ? v.GetInt64() : 0,
+                T = trackIdElement.TryGetProperty("t", out var t) ? t.GetInt64() : 0,
+                At = trackIdElement.TryGetProperty("at", out var at) ? at.GetInt64() : 0,
+                Uid = trackIdElement.TryGetProperty("uid", out var uid) ? uid.GetInt64() : 0,
+                Alg = trackIdElement.TryGetProperty("alg", out var alg) ? (object)alg : null
+            };
+            trackIds.Add(trackId);
+        }
+
+        return trackIds;
     }
 
     private static Album ParseAlbum(JsonElement albumElement)
@@ -300,5 +434,21 @@ public class NetEaseApiClient
         }
 
         return urlInfos;
+    }
+
+    /// <summary>
+    /// 清除歌单缓存
+    /// </summary>
+    public static void ClearPlaylistCache()
+    {
+        _playlistCache.Clear();
+    }
+
+    /// <summary>
+    /// 获取缓存统计信息
+    /// </summary>
+    public static int GetCacheCount()
+    {
+        return _playlistCache.Count;
     }
 }

@@ -29,6 +29,13 @@ public class Program
                 logging.ClearProviders();
                 logging.AddConsole();
                 logging.SetMinimumLevel(LogLevel.Information);
+                
+                // 过滤掉HTTP客户端的详细日志
+                logging.AddFilter("System.Net.Http", LogLevel.Warning);
+                logging.AddFilter("Microsoft.Extensions.Http", LogLevel.Warning);
+                logging.AddFilter("System.Net.Http.HttpClient.Default.LogicalHandler", LogLevel.None);
+                logging.AddFilter("System.Net.Http.HttpClient.Default.ClientHandler", LogLevel.None);
+                logging.AddFilter("System.Net.Http.HttpClient", LogLevel.Warning);
             })
             .ConfigureServices((context, services) =>
             {
@@ -47,6 +54,7 @@ public class Program
                 services.AddSingleton<FileNameService>();
                 services.AddSingleton<CookieService>();
                 services.AddSingleton<ProgressService>();
+                services.AddSingleton<FileRenameService>();
 
                 // Commands
                 services.AddSingleton<DownloadCommand>();

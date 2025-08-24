@@ -35,12 +35,20 @@ public class PlaylistAdapter : BaseAdapter
         if (playlist == null)
             return new List<Song>();
 
-        // Get song URLs
+        // 现在 playlist.Tracks 已经通过 TrackIds 获取了完整的歌曲列表
+        if (!playlist.Tracks.Any())
+        {
+            return new List<Song>();
+        }
+
+        // Get song URLs for all tracks
         var trackIds = playlist.Tracks.Select(t => t.Id).ToList();
         var songUrls = await _apiClient.GetSongUrlsAsync(trackIds, quality);
 
-        // Create a lookup for song URLs
-        var urlLookup = songUrls.ToDictionary(s => s.Id, s => s);
+        // Create a lookup for song URLs, handle potential duplicates
+        var urlLookup = songUrls
+            .GroupBy(s => s.Id)
+            .ToDictionary(g => g.Key, g => g.First());
 
         // Convert tracks to songs
         return ConvertToSongs(playlist.Tracks, track =>
@@ -55,6 +63,7 @@ public class PlaylistAdapter : BaseAdapter
                 Url = urlInfo?.Url,
                 Extension = GetFileExtension(urlInfo?.Url),
                 IsFreeTrial = urlInfo?.FreeTrialInfo != null,
+                MD5 = urlInfo?.Md5,
                 RawData = track
             };
         });

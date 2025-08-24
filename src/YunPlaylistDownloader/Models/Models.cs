@@ -11,6 +11,7 @@ public class Song
     public string Index { get; set; } = string.Empty;
     public int RawIndex { get; set; }
     public object? RawData { get; set; }
+    public string? MD5 { get; set; }
 }
 
 public class Playlist
@@ -20,6 +21,18 @@ public class Playlist
     public string? CoverUrl { get; set; }
     public string Description { get; set; } = string.Empty;
     public List<TrackData> Tracks { get; set; } = new();
+    public List<TrackIdData> TrackIds { get; set; } = new();
+    public long TrackCount { get; set; }
+}
+
+public class TrackIdData
+{
+    public long Id { get; set; }
+    public long V { get; set; }
+    public long T { get; set; }
+    public long At { get; set; }
+    public object? Alg { get; set; }
+    public long Uid { get; set; }
 }
 
 public class Album
@@ -109,6 +122,8 @@ public class DownloadOptions
     public bool Cover { get; set; } = false;
     public string Cookie { get; set; } = "yun.cookie.txt";
     public bool SkipTrial { get; set; } = false;
+    public bool Rename { get; set; } = false;
+    public bool Quiet { get; set; } = false;
 }
 
 public enum PageType

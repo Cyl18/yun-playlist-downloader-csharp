@@ -14,19 +14,25 @@ public class DownloadCommand
     private readonly DownloadService _downloadService;
     private readonly CookieService _cookieService;
     private readonly AdapterFactory _adapterFactory;
+    private readonly ProgressService _progressService;
+    private readonly FileRenameService _fileRenameService;
 
     public DownloadCommand(
         ILogger<DownloadCommand> logger,
         NetEaseApiClient apiClient,
         DownloadService downloadService,
         CookieService cookieService,
-        AdapterFactory adapterFactory)
+        AdapterFactory adapterFactory,
+        ProgressService progressService,
+        FileRenameService fileRenameService)
     {
         _logger = logger;
         _apiClient = apiClient;
         _downloadService = downloadService;
         _cookieService = cookieService;
         _adapterFactory = adapterFactory;
+        _progressService = progressService;
+        _fileRenameService = fileRenameService;
     }
 
     public void ConfigureCommand(RootCommand rootCommand)
@@ -83,6 +89,16 @@ public class DownloadCommand
             description: "跳过试听歌曲",
             getDefaultValue: () => false);
 
+        var renameOption = new Option<bool>(
+            "--rename",
+            description: "重命名模式：重命名现有文件为歌单格式，不在歌单内的文件重命名为MD5",
+            getDefaultValue: () => false);
+
+        var quietOption = new Option<bool>(
+            "--quiet",
+            description: "安静模式：只显示错误和结果信息",
+            getDefaultValue: () => false);
+
         qualityOption.AddValidator(result =>
         {
             var value = result.GetValueForOption(qualityOption);
@@ -103,6 +119,8 @@ public class DownloadCommand
         rootCommand.AddOption(coverOption);
         rootCommand.AddOption(cookieOption);
         rootCommand.AddOption(skipTrialOption);
+        rootCommand.AddOption(renameOption);
+        rootCommand.AddOption(quietOption);
 
         rootCommand.SetHandler(async (context) =>
         {
@@ -117,6 +135,8 @@ public class DownloadCommand
             var cover = context.ParseResult.GetValueForOption(coverOption);
             var cookie = context.ParseResult.GetValueForOption(cookieOption);
             var skipTrial = context.ParseResult.GetValueForOption(skipTrialOption);
+            var rename = context.ParseResult.GetValueForOption(renameOption);
+            var quiet = context.ParseResult.GetValueForOption(quietOption);
 
             var options = new DownloadOptions
             {
@@ -130,7 +150,9 @@ public class DownloadCommand
                 Progress = progress,
                 Cover = cover,
                 Cookie = cookie ?? "yun.cookie.txt",
-                SkipTrial = skipTrial
+                SkipTrial = skipTrial,
+                Rename = rename,
+                Quiet = quiet
             };
 
             await ExecuteDownloadAsync(options);
@@ -141,8 +163,14 @@ public class DownloadCommand
     {
         try
         {
-            // Show current parameters
-            ShowParameters(options);
+            // 设置安静模式
+            _progressService.SetQuietMode(options.Quiet);
+            
+            // Show current parameters (除非是安静模式)
+            if (!options.Quiet)
+            {
+                ShowParameters(options);
+            }
 
             // Load cookie if specified
             if (!string.IsNullOrEmpty(options.Cookie))
@@ -157,70 +185,90 @@ public class DownloadCommand
                 return;
             }
 
-            // Create adapter
-            var adapter = _adapterFactory.CreateAdapter(options.Url);
-            
-            // Get title and songs
-            var title = await adapter.GetTitleAsync();
-            var songs = await adapter.GetSongsAsync(options.Quality);
-
-            if (!songs.Any())
+            await _progressService.WithProgressAsync(async () =>
             {
-                ProgressService.ShowWarning("没有找到可下载的歌曲");
-                return;
-            }
-
-            // Filter out invalid songs
-            var validSongs = songs.Where(s => !string.IsNullOrEmpty(s.Url)).ToList();
-            var invalidSongs = songs.Where(s => string.IsNullOrEmpty(s.Url)).ToList();
-
-            if (invalidSongs.Any())
-            {
-                ProgressService.ShowWarning($"有 {invalidSongs.Count} 首歌曲无法获取下载链接");
-            }
-
-            if (options.SkipTrial)
-            {
-                var trialSongs = validSongs.Where(s => s.IsFreeTrial == true).ToList();
-                validSongs = validSongs.Where(s => s.IsFreeTrial != true).ToList();
+                // Create adapter
+                var adapter = _adapterFactory.CreateAdapter(options.Url);
                 
-                if (trialSongs.Any())
+                // Get title and songs
+                var title = await adapter.GetTitleAsync();
+                var songs = await adapter.GetSongsAsync(options.Quality);
+
+                if (!songs.Any())
                 {
-                    ProgressService.ShowInfo($"跳过 {trialSongs.Count} 首试听歌曲");
+                    ProgressService.ShowWarning("没有找到可下载的歌曲");
+                    return;
                 }
-            }
 
-            if (!validSongs.Any())
-            {
-                ProgressService.ShowError("没有可下载的歌曲");
-                return;
-            }
-
-            ProgressService.ShowInfo($"准备下载 {validSongs.Count} 首歌曲");
-
-            // Download cover if requested
-            if (options.Cover)
-            {
-                var coverUrl = await adapter.GetCoverUrlAsync();
-                if (!string.IsNullOrEmpty(coverUrl))
+                // Handle rename mode
+                if (options.Rename)
                 {
-                    var coverPath = Path.Combine(title ?? "Unknown", "cover.jpg");
-                    await _downloadService.DownloadCoverAsync(coverUrl, coverPath);
+                    ProgressService.ShowInfo($"重命名模式：重命名 {title} 中的文件");
+                    var renameFormat = ":name/:singer - :albumName - :songName.:ext";
+                    await _fileRenameService.RenamePlaylistFilesAsync(songs, title ?? "Unknown", renameFormat);
+                    return;
                 }
+
+                // Normal download mode
+                // Filter out invalid songs
+                var validSongs = songs.Where(s => !string.IsNullOrEmpty(s.Url)).ToList();
+                var invalidSongs = songs.Where(s => string.IsNullOrEmpty(s.Url)).ToList();
+
+                if (invalidSongs.Any())
+                {
+                    ProgressService.ShowWarning($"有 {invalidSongs.Count} 首歌曲无法获取下载链接");
+                }
+
+                if (options.SkipTrial)
+                {
+                    var trialSongs = validSongs.Where(s => s.IsFreeTrial == true).ToList();
+                    validSongs = validSongs.Where(s => s.IsFreeTrial != true).ToList();
+                    
+                    if (trialSongs.Any())
+                    {
+                        ProgressService.ShowInfo($"跳过 {trialSongs.Count} 首试听歌曲");
+                    }
+                }
+
+                if (!validSongs.Any())
+                {
+                    ProgressService.ShowError("没有可下载的歌曲");
+                    return;
+                }
+
+                ProgressService.ShowInfo($"准备下载 {validSongs.Count} 首歌曲");
+
+                // Download cover if requested
+                if (options.Cover)
+                {
+                    var coverUrl = await adapter.GetCoverUrlAsync();
+                    if (!string.IsNullOrEmpty(coverUrl))
+                    {
+                        var coverPath = Path.Combine(title ?? "Unknown", "cover.jpg");
+                        await _downloadService.DownloadCoverAsync(coverUrl, coverPath);
+                    }
+                }
+
+                // Start downloading songs
+                await _downloadService.DownloadSongsAsync(
+                    validSongs,
+                    options.Format,
+                    title,
+                    options.Concurrency,
+                    options.RetryTimes,
+                    options.RetryTimeout,
+                    options.Skip,
+                    options.SkipTrial);
+            });
+
+            if (options.Rename)
+            {
+                ProgressService.ShowSuccess("文件重命名完成!");
             }
-
-            // Start downloading songs
-            await _downloadService.DownloadSongsAsync(
-                validSongs,
-                options.Format,
-                title,
-                options.Concurrency,
-                options.RetryTimes,
-                options.RetryTimeout,
-                options.Skip,
-                options.SkipTrial);
-
-            ProgressService.ShowSuccess("所有下载任务完成!");
+            else
+            {
+                ProgressService.ShowSuccess("所有下载任务完成!");
+            }
         }
         catch (Exception ex)
         {
@@ -242,7 +290,8 @@ public class DownloadCommand
             { "跳过已存在", options.Skip },
             { "显示进度", options.Progress },
             { "下载封面", options.Cover },
-            { "跳过试听", options.SkipTrial }
+            { "跳过试听", options.SkipTrial },
+            { "重命名模式", options.Rename ? "是（仅重命名文件）" : "否" }
         };
 
         ProgressService.ShowTable("当前参数", parameters);

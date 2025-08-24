@@ -3,6 +3,7 @@ using YunPlaylistDownloader.Models;
 using Polly;
 using System.Net;
 using Humanizer;
+using Spectre.Console;
 
 namespace YunPlaylistDownloader.Services;
 
@@ -35,7 +36,7 @@ public class DownloadService
     {
         if (string.IsNullOrEmpty(song.Url))
         {
-            _logger.LogWarning("Song {SongName} has no download URL", song.SongName);
+            _progressService.LogSafe(LogLevel.Warning, $"歌曲 {song.SongName} 没有下载链接");
             return false;
         }
 
@@ -48,12 +49,15 @@ public class DownloadService
             var fileInfo = new FileInfo(filePath);
             if (fileInfo.Length > 0)
             {
-                _logger.LogInformation("Skipping existing file: {FilePath}", filePath);
-                return true;
+                _progressService.LogSafe(LogLevel.Information, $"跳过已存在文件: {Path.GetFileName(filePath)}");
+                return true; // Return true for skipped files
             }
         }
 
-        var taskId = _progressService.CreateDownloadTask($"下载: {song.Singer} - {song.SongName}");
+        // Create temporary file path
+        var tempFilePath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid()}.tmp");
+
+        var taskId = _progressService.CreateDownloadTask($"下载: {song.Singer.EscapeMarkup()} - {song.SongName.EscapeMarkup()}");
 
         try
         {
@@ -65,8 +69,8 @@ public class DownloadService
                     sleepDurationProvider: retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),
                     onRetry: (outcome, timespan, retryCount, context) =>
                     {
-                        _logger.LogWarning("重试下载 {RetryCount}/{MaxRetries}: {SongName} 等待 {Delay}", 
-                            retryCount, retryTimes, song.SongName, timespan.Humanize());
+                        _progressService.LogSafe(LogLevel.Warning, 
+                            $"重试下载 {retryCount}/{retryTimes}: {song.SongName} 等待 {timespan.Humanize()}");
                     });
 
             var success = await retryPolicy.ExecuteAsync(async () =>
@@ -78,10 +82,10 @@ public class DownloadService
                 response.EnsureSuccessStatusCode();
 
                 var totalBytes = response.Content.Headers.ContentLength ?? 0;
-                _progressService.UpdateTask(taskId, 0, $"下载: {song.Singer} - {song.SongName} ({totalBytes.Bytes().Humanize()})");
+                _progressService.UpdateTask(taskId, 0, $"下载: {song.Singer.EscapeMarkup()} - {song.SongName.EscapeMarkup()} ({totalBytes.Bytes().Humanize()})");
 
                 using var contentStream = await response.Content.ReadAsStreamAsync(cts.Token);
-                using var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None);
+                using var fileStream = new FileStream(tempFilePath, FileMode.Create, FileAccess.Write, FileShare.None);
 
                 var buffer = new byte[8192];
                 var totalBytesRead = 0L;
@@ -104,15 +108,58 @@ public class DownloadService
 
             if (success)
             {
-                _progressService.CompleteTask(taskId, $"[green]完成: {song.Singer} - {song.SongName}[/]");
-                _logger.LogInformation("Successfully downloaded: {SongName} to {FilePath}", song.SongName, filePath);
-                return true;
+                try
+                {
+                    // Move temporary file to final destination
+                    if (File.Exists(filePath))
+                    {
+                        File.Delete(filePath);
+                    }
+                    File.Move(tempFilePath, filePath);
+                    
+                    _progressService.CompleteTask(taskId, $"[green]完成: {song.Singer.EscapeMarkup()} - {song.SongName.EscapeMarkup()}[/]");
+                    _progressService.LogSafe(LogLevel.Information, $"下载完成: {song.SongName}");
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    _progressService.LogSafe(LogLevel.Error, $"移动临时文件失败: {song.SongName} - {ex.Message}");
+                    
+                    // Clean up temporary file on failure
+                    try
+                    {
+                        if (File.Exists(tempFilePath))
+                        {
+                            File.Delete(tempFilePath);
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore cleanup errors
+                    }
+                    
+                    _progressService.FailTask(taskId, $"[red]失败: {song.Singer.EscapeMarkup()} - {song.SongName.EscapeMarkup()}[/]");
+                    return false;
+                }
             }
         }
         catch (Exception ex)
         {
-            _progressService.FailTask(taskId, $"[red]失败: {song.Singer} - {song.SongName}[/]");
-            _logger.LogError(ex, "Failed to download song: {SongName}", song.SongName);
+            _progressService.FailTask(taskId, $"[red]失败: {song.Singer.EscapeMarkup()} - {song.SongName.EscapeMarkup()}[/]");
+            _progressService.LogSafe(LogLevel.Error, $"下载失败: {song.SongName} - {ex.Message}");
+            
+            // Clean up temporary file on exception
+            try
+            {
+                if (File.Exists(tempFilePath))
+                {
+                    File.Delete(tempFilePath);
+                }
+            }
+            catch
+            {
+                // Ignore cleanup errors
+            }
         }
 
         return false;
@@ -173,6 +220,12 @@ public class DownloadService
 
         _logger.LogInformation("开始下载 {Count} 首歌曲，并发数: {Concurrency}", songsToDownload.Count, concurrency);
 
+        // Create overall progress task
+        var overallTaskId = _progressService.CreateOverallProgressTask(
+            $"总进度: 0/{songsToDownload.Count} 首歌曲", 
+            songsToDownload.Count);
+
+        var completedCount = 0;
         var semaphore = new SemaphoreSlim(concurrency, concurrency);
         var tasks = songsToDownload.Select(async song =>
         {
@@ -180,7 +233,12 @@ public class DownloadService
             try
             {
                 var fileName = _fileNameService.GenerateFileName(song, format, playlistName);
-                await DownloadSongAsync(song, fileName, retryTimes, timeoutMinutes, skipExisting, cancellationToken);
+                var success = await DownloadSongAsync(song, fileName, retryTimes, timeoutMinutes, skipExisting, cancellationToken);
+                
+                // Update overall progress
+                var completed = Interlocked.Increment(ref completedCount);
+                _progressService.IncrementTask(overallTaskId, 1, 
+                    $"总进度: {completed}/{songsToDownload.Count} 首歌曲 {(success ? "✓" : "✗")}");
             }
             finally
             {
@@ -189,6 +247,9 @@ public class DownloadService
         });
 
         await Task.WhenAll(tasks);
+        
+        // Complete overall progress
+        _progressService.CompleteTask(overallTaskId, $"[green]完成: {songsToDownload.Count}/{songsToDownload.Count} 首歌曲[/]");
         _logger.LogInformation("所有下载任务完成");
     }
 }

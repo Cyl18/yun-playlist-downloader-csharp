@@ -1,24 +1,126 @@
 using Spectre.Console;
 using Humanizer;
+using Microsoft.Extensions.Logging;
 
 namespace YunPlaylistDownloader.Services;
 
 public class ProgressService
 {
     private readonly Dictionary<string, ProgressTask> _tasks = new();
+    private readonly ILogger<ProgressService> _logger;
     private ProgressContext? _progressContext;
+    private readonly SemaphoreSlim _initializationSemaphore = new(1, 1);
+    private bool _isInitialized = false;
+    private bool _isProgressMode = false;
+    private bool _isQuietMode = false;
+    private readonly List<string> _pendingLogs = new();
 
-    public void Initialize(int totalTasks)
+    public ProgressService(ILogger<ProgressService> logger)
     {
-        AnsiConsole.Progress()
+        _logger = logger;
+    }
+
+    public void SetQuietMode(bool quiet)
+    {
+        _isQuietMode = quiet;
+    }
+
+    public async Task InitializeAsync()
+    {
+        await _initializationSemaphore.WaitAsync();
+        try
+        {
+            if (_isInitialized) return;
+
+            _isInitialized = true;
+            // We'll set the context when we actually start the progress display
+        }
+        finally
+        {
+            _initializationSemaphore.Release();
+        }
+    }
+
+    public async Task<T> WithProgressAsync<T>(Func<Task<T>> operation)
+    {
+        if (!_isInitialized)
+            await InitializeAsync();
+
+        _isProgressMode = true;
+        
+        return await AnsiConsole.Progress()
+            .Columns(
+                new TaskDescriptionColumn(),
+                new ProgressBarColumn(),
+                new PercentageColumn(),
+                new RemainingTimeColumn(),
+                new SpinnerColumn())
             .StartAsync(async ctx =>
             {
                 _progressContext = ctx;
-                
-                // Wait until all tasks are completed or the service is disposed
-                while (_tasks.Values.Any(t => !t.IsFinished))
+                try
                 {
-                    await Task.Delay(100);
+                    var result = await operation();
+                    
+                    // 输出进度模式期间收集的日志
+                    if (_pendingLogs.Any())
+                    {
+                        AnsiConsole.WriteLine();
+                        foreach (var log in _pendingLogs)
+                        {
+                            AnsiConsole.MarkupLine(log);
+                        }
+                        _pendingLogs.Clear();
+                    }
+                    
+                    return result;
+                }
+                finally
+                {
+                    _progressContext = null;
+                    _tasks.Clear();
+                    _isProgressMode = false;
+                }
+            });
+    }
+
+    public async Task WithProgressAsync(Func<Task> operation)
+    {
+        if (!_isInitialized)
+            await InitializeAsync();
+
+        _isProgressMode = true;
+        
+        await AnsiConsole.Progress()
+            .Columns(
+                new TaskDescriptionColumn(),
+                new ProgressBarColumn(),
+                new PercentageColumn(),
+                new RemainingTimeColumn(),
+                new SpinnerColumn())
+            .StartAsync(async ctx =>
+            {
+                _progressContext = ctx;
+                try
+                {
+                    await operation();
+                    
+                    // 输出进度模式期间收集的日志
+                    if (_pendingLogs.Any())
+                    {
+                        AnsiConsole.WriteLine();
+                        foreach (var log in _pendingLogs)
+                        {
+                            AnsiConsole.MarkupLine(log);
+                        }
+                        _pendingLogs.Clear();
+                    }
+                }
+                finally
+                {
+                    _progressContext = null;
+                    _tasks.Clear();
+                    _isProgressMode = false;
                 }
             });
     }
@@ -26,7 +128,11 @@ public class ProgressService
     public string CreateDownloadTask(string description, long maxValue = 100)
     {
         if (_progressContext == null)
-            throw new InvalidOperationException("Progress context not initialized");
+        {
+            // Fallback for cases where progress context is not available
+            _logger.LogInformation(description);
+            return Guid.NewGuid().ToString();
+        }
 
         var taskId = Guid.NewGuid().ToString();
         var task = _progressContext.AddTask(description, maxValue: maxValue);
@@ -35,11 +141,65 @@ public class ProgressService
         return taskId;
     }
 
+    public string CreateOverallProgressTask(string description, long totalItems)
+    {
+        if (_progressContext == null)
+        {
+            _logger.LogInformation(description);
+            return Guid.NewGuid().ToString();
+        }
+
+        var taskId = Guid.NewGuid().ToString();
+        var task = _progressContext.AddTask($"[bold blue]{description}[/]", maxValue: totalItems);
+        _tasks[taskId] = task;
+        
+        return taskId;
+    }
+
+    public void LogSafe(LogLevel level, string message)
+    {
+        // 在安静模式下，只记录错误和警告
+        if (_isQuietMode && level != LogLevel.Error && level != LogLevel.Warning)
+        {
+            return;
+        }
+
+        if (_isProgressMode)
+        {
+            // 在进度模式下，收集日志消息
+            var coloredMessage = level switch
+            {
+                LogLevel.Error => $"[red]✗ {message.EscapeMarkup()}[/]",
+                LogLevel.Warning => $"[yellow]⚠ {message.EscapeMarkup()}[/]",
+                LogLevel.Information => $"[blue]ℹ {message.EscapeMarkup()}[/]",
+                _ => message.EscapeMarkup()
+            };
+            _pendingLogs.Add(coloredMessage);
+        }
+        else
+        {
+            // 非进度模式下直接输出
+            _logger.Log(level, message);
+        }
+    }
+
     public void UpdateTask(string taskId, double value, string? description = null)
     {
         if (_tasks.TryGetValue(taskId, out var task))
         {
             task.Value = value;
+            if (description != null)
+            {
+                task.Description = description;
+            }
+        }
+    }
+
+    public void IncrementTask(string taskId, double increment = 1, string? description = null)
+    {
+        if (_tasks.TryGetValue(taskId, out var task))
+        {
+            task.Increment(increment);
             if (description != null)
             {
                 task.Description = description;
